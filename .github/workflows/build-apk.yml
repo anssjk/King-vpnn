@@ -1,11 +1,10 @@
-
 name: Build KING VPN APK
 
 # ساخت APK اندروید روی سرور گیت‌هاب — بدون کامپیوتر و بدون Termux.
 # راهنمای استفاده: فایل GITHUB_ACTIONS_GUIDE.md
 #
 # این فایل باید دقیقاً در این مسیر باشد:
-#   .github/workflows/build-apk.yml
+# .github/workflows/build-apk.yml
 # گیت‌هاب فقط فایل‌های داخل .github/workflows/ در ریشه‌ی ریپو را می‌شناسد.
 
 on:
@@ -34,24 +33,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # اگر پروژه در ریشه‌ی ریپو نیست (مثلاً داخل یک پوشه یا zip)، پیدایش می‌کنیم.
+      # اگر پروژه در ریشه‌ی ریپو نیست، پیدایش می‌کنیم.
       - name: Locate the app source
         run: |
           set -e
           if [ -f package.json ]; then
-            echo "APP_DIR=$PWD" >> "$GITHUB_ENV"; exit 0
+            echo "APP_DIR=$PWD" >> "$GITHUB_ENV"
+            exit 0
           fi
+
           ZIP=$(ls -1 *.zip 2>/dev/null | head -n 1 || true)
           if [ -n "$ZIP" ]; then
-            rm -rf _src && mkdir -p _src && unzip -q -o "$ZIP" -d _src
-            DIR=$(find _src -maxdepth 3 -name package.json -not -path '*/node_modules/*' -printf '%h\n' | head -n 1)
+            rm -rf _src
+            mkdir -p _src
+            unzip -q -o "$ZIP" -d _src
+            DIR=$(find _src -maxdepth 3 -name package.json \
+              -not -path '*/node_modules/*' -printf '%h\n' | head -n 1)
           else
-            DIR=$(find . -maxdepth 3 -name package.json -not -path '*/node_modules/*' -printf '%h\n' | head -n 1)
+            DIR=$(find . -maxdepth 3 -name package.json \
+              -not -path '*/node_modules/*' -printf '%h\n' | head -n 1)
           fi
+
           if [ -z "$DIR" ]; then
             echo "::error::هیچ package.json پیدا نشد. فایل‌های پروژه را در ریشه‌ی ریپازیتوری آپلود کنید."
             exit 1
           fi
+
           echo "APP_DIR=$PWD/$DIR" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v4
@@ -65,8 +72,8 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      # تمام مراحل بیلد در scripts/ci-build-apk.sh است تا این فایل کوتاه بماند.
-      # هیچ آدرس پنلی اینجا لازم نیست: کاربر آن را در اولین اجرای اپ وارد می‌کند.
+      # تمام مراحل بیلد در scripts/ci-build-apk.sh است.
+      # هیچ آدرس پنلی اینجا لازم نیست؛ کاربر آن را در اولین اجرای اپ وارد می‌کند.
       - name: Build the APK
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
