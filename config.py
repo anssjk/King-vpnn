@@ -99,11 +99,19 @@ def _resolve_cookies(download_dir: Path) -> Path | None:
 def get_settings() -> Settings:
     load_dotenv()
 
-    token = os.getenv("BOT_TOKEN", "").strip()
+    token = ""
+    for key in ("BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "TOKEN"):
+        # فاصله، «"» و «'» اضافه‌ای که موقع کپی/پیست وارد می‌شود حذف می‌شود
+        token = os.getenv(key, "").strip().strip("\"'").strip()
+        if token:
+            break
     if not token:
         raise ConfigError(
             "BOT_TOKEN تنظیم نشده است.\n"
-            "فایل .env بسازید و توکن BotFather را در آن بگذارید."
+            "روی Railway: سرویس را باز کنید ← تب Variables ← New Variable\n"
+            "نام: BOT_TOKEN  و مقدار: توکن BotFather (مثل 123456789:AAE...)\n"
+            "بعد از ذخیره، Deploy را دوباره انجام دهید.\n"
+            "اجرای محلی: فایل .env بسازید و توکن را در آن بگذارید."
         )
     if ":" not in token:
         raise ConfigError("BOT_TOKEN شکل درستی ندارد (باید شامل «:» باشد).")
