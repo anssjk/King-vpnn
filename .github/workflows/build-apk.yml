@@ -80,12 +80,6 @@ jobs:
           echo "sdk.dir=$ANDROID_HOME" > android/local.properties
           cat "$f"
 
-      - name: Show NDK settings (diagnostics)
-        working-directory: ${{ steps.root.outputs.dir }}
-        run: |
-          grep -rn "ndkVersion" android/build.gradle android/app/build.gradle node_modules/react-native/gradle 2>/dev/null | head -20 || true
-          ls "$ANDROID_HOME/ndk" || true
-
       - name: Setup Gradle cache
         uses: gradle/actions/setup-gradle@v4
 
