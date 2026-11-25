@@ -599,7 +599,37 @@ def _too_large_text(size: int, settings: Settings) -> str:
 # server.py
 # ==================================================================
 
-STATIC_DIR = Path(__file__).parent / "static"
+BASE_DIR = Path(__file__).parent
+STATIC_DIR = BASE_DIR / "static"
+
+# فقط همین فایل‌ها سرو می‌شوند (تا فایل‌های پایتون/.env هرگز لو نروند)
+_ALLOWED_ASSETS = {"index.html", "app.css", "app.js"}
+
+
+def _find_asset(name: str) -> Path | None:
+    """فایل را در static/ و در صورت نبودن، کنار webapp.py پیدا می‌کند.
+
+    اگر فایل‌ها هنگام آپلود به گیت‌هاب تغییر نام داده باشند
+    (مثل app-1.js یا index-2.html) هم پیدا می‌شوند.
+    """
+    if name not in _ALLOWED_ASSETS:
+        return None
+    stem, dot, ext = name.rpartition(".")
+    for folder in (STATIC_DIR, BASE_DIR):
+        exact = folder / name
+        if exact.is_file():
+            return exact
+        for alt in sorted(folder.glob(f"{stem}-*.{ext}")):
+            if alt.is_file():
+                return alt
+    return None
+
+
+async def static_file(request: web.Request) -> web.StreamResponse:
+    path = _find_asset(request.match_info["name"])
+    if path is None:
+        raise web.HTTPNotFound()
+    return web.FileResponse(path, headers={"Cache-Control": "no-cache"})
 
 # کلیدهایی که در request ذخیره می‌شوند
 KEY_USER = "tg_user"
@@ -674,8 +704,8 @@ async def error_middleware(request: web.Request, handler):
 # صفحه‌ها
 # ----------------------------------------------------------------------
 async def index(request: web.Request) -> web.StreamResponse:
-    path = STATIC_DIR / "index.html"
-    if not path.is_file():
+    path = _find_asset("index.html")
+    if path is None:
         return web.Response(text="index.html پیدا نشد", status=500)
     return web.FileResponse(
         path,
@@ -792,7 +822,7 @@ def create_app(settings: Settings, service: DownloadService) -> web.Application:
 
     app.router.add_get("/", index)
     app.router.add_get("/health", health)
-    app.router.add_static("/static/", STATIC_DIR, name="static")
+    app.router.add_get("/static/{name}", static_file)
 
     app.router.add_post("/api/probe", api_probe)
     app.router.add_post("/api/download", api_download)
