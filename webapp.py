@@ -26,8 +26,11 @@ from downloader import (
     DownloadResult,
     InvalidLink,
     UnsupportedSite,
-    available_heights,
+    build_meta,
+    clean_detail,
+    fits,
     parse_link,
+    pick_height,
 )
 from utils import human_duration, human_size, remove_tree, ProgressTracker
 
@@ -230,6 +233,9 @@ class WebJob:
     title: str = ""
     duration: int | None = None
     heights: list[int] = field(default_factory=list)
+    sizes: dict[int, int] = field(default_factory=dict)
+    portrait: bool = False
+    best_height: int | None = None
     thumbnail: str = ""
     state: JobState = JobState.QUEUED
     error_kind: str = ""
@@ -259,6 +265,24 @@ class WebJob:
     def cancel(self) -> None:
         self.cancel_event.set()
 
+    limit: int = 0
+
+    def _qualities(self) -> list[dict]:
+        """کیفیت‌های قابل انتخاب (فقط آن‌هایی که در سقف ارسال جا می‌شوند)."""
+        items = []
+        for height in self.heights:
+            size = self.sizes.get(height, 0)
+            if self.limit and not fits(size, self.limit):
+                continue
+            items.append(
+                {
+                    "height": height,
+                    "size": size,
+                    "size_text": human_size(size) if size else "",
+                }
+            )
+        return items
+
     def to_dict(self) -> dict:
         """خروجی JSON برای فرانت‌اند."""
         return {
@@ -270,6 +294,8 @@ class WebJob:
             "duration": self.duration,
             "duration_text": human_duration(self.duration),
             "heights": self.heights,
+            "best_height": self.best_height,
+            "qualities": self._qualities(),
             "thumbnail": self.thumbnail,
             "percent": round(self.percent, 1),
             "downloaded": self.downloaded,
@@ -331,6 +357,7 @@ class DownloadService:
                 job_id=uuid.uuid4().hex[:12],
                 chat_id=chat_id,
                 user_id=user_id,
+                limit=self.settings.upload_limit,
             )
             self._jobs[job.job_id] = job
             return job
@@ -385,22 +412,17 @@ class DownloadService:
         except DownloadError as exc:
             job.state = JobState.ERROR
             job.error_kind = exc.kind.value
-            job.error_text = _error_text(exc.kind)
+            job.error_text = _error_text(exc.kind, self.settings, exc.detail)
             raise ServiceError("probe_failed", job.error_text, 422) from exc
 
-        if info.get("_type") == "playlist":
-            entries = [e for e in (info.get("entries") or []) if e]
-            info = entries[0] if entries else {}
-
-        if not info:
-            job.state = JobState.ERROR
-            job.error_kind = DownloadErrorKind.NOT_FOUND.value
-            job.error_text = _error_text(DownloadErrorKind.NOT_FOUND)
-            raise ServiceError("not_found", job.error_text, 404)
+        meta = build_meta(info, self.settings, link.url)
 
         # --- محدودیت مدت ---
-        duration = info.get("duration")
-        if self.settings.max_duration_sec and duration and duration > self.settings.max_duration_sec:
+        if (
+            self.settings.max_duration_sec
+            and meta.duration
+            and meta.duration > self.settings.max_duration_sec
+        ):
             job.state = JobState.ERROR
             job.error_kind = DownloadErrorKind.TOO_LONG.value
             job.error_text = (
@@ -409,18 +431,13 @@ class DownloadService:
             )
             raise ServiceError("too_long", job.error_text, 422)
 
-        # --- محدودیت حجم تقریبی ---
-        approx = info.get("filesize") or info.get("filesize_approx")
-        if approx and approx > self.settings.upload_limit:
-            job.state = JobState.ERROR
-            job.error_kind = DownloadErrorKind.TOO_LARGE.value
-            job.error_text = _too_large_text(approx, self.settings)
-            raise ServiceError("too_large", job.error_text, 422)
-
-        job.title = (info.get("title") or "ویدیو").strip()[:200]
-        job.duration = duration
-        job.heights = available_heights(info)
-        job.thumbnail = info.get("thumbnail") or ""
+        job.title = meta.title
+        job.duration = meta.duration
+        job.heights = meta.heights
+        job.sizes = meta.sizes
+        job.portrait = meta.portrait
+        job.best_height = meta.best_height
+        job.thumbnail = meta.thumbnail
         job.state = JobState.READY
         return job
 
@@ -440,6 +457,10 @@ class DownloadService:
             raise ServiceError("finished", "این کار تمام شده است. لینک جدیدی بفرست.", 409)
         if not job.url:
             raise ServiceError("no_url", "اول لینک را بررسی کن.", 400)
+
+        if not audio_only:
+            # «بهترین» (None) یعنی بهترین کیفیتی که در سقف ارسال جا می‌شود
+            height = pick_height(job.heights, job.sizes, self.settings.upload_limit, height)
 
         job.cancel_event.clear()
         job.state = JobState.DOWNLOADING
@@ -470,68 +491,72 @@ class DownloadService:
         progress_task = asyncio.create_task(self._progress_loop(job, tracker))
 
         try:
-            result = await self.downloader.download(
-                job.url,
-                job_dir,
-                tracker,
-                height=height,
-                audio_only=audio_only,
-                cancel_event=job.cancel_event,
-            )
-        except DownloadCancelled:
-            job.state = JobState.CANCELLED
-            job.error_text = "دانلود لغو شد."
-            return
-        except DownloadError as exc:
-            job.state = JobState.ERROR
-            job.error_kind = exc.kind.value
-            job.error_text = _error_text(exc.kind)
-            return
-        except Exception:  # noqa: BLE001
-            logger.exception("خطای پیش‌بینی‌نشده در دانلود وب")
-            job.state = JobState.ERROR
-            job.error_kind = DownloadErrorKind.UNKNOWN.value
-            job.error_text = _error_text(DownloadErrorKind.UNKNOWN)
-            return
-        finally:
-            progress_task.cancel()
             try:
-                await progress_task
-            except asyncio.CancelledError:
-                pass
+                result = await self.downloader.download(
+                    job.url,
+                    job_dir,
+                    tracker,
+                    height=height,
+                    heights=job.heights,
+                    portrait=job.portrait,
+                    audio_only=audio_only,
+                    cancel_event=job.cancel_event,
+                )
+            except DownloadCancelled:
+                job.state = JobState.CANCELLED
+                job.error_text = "دانلود لغو شد."
+                return
+            except DownloadError as exc:
+                job.state = JobState.ERROR
+                job.error_kind = exc.kind.value
+                job.error_text = _error_text(exc.kind, self.settings, exc.detail)
+                return
+            except Exception:  # noqa: BLE001
+                logger.exception("خطای پیش‌بینی‌نشده در دانلود وب")
+                job.state = JobState.ERROR
+                job.error_kind = DownloadErrorKind.UNKNOWN.value
+                job.error_text = _error_text(DownloadErrorKind.UNKNOWN, self.settings)
+                return
+            finally:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
 
-        # --- حجم واقعی ---
-        if result.filesize > self.settings.upload_limit:
-            job.state = JobState.ERROR
-            job.error_kind = DownloadErrorKind.TOO_LARGE.value
-            job.error_text = _too_large_text(result.filesize, self.settings)
-            remove_tree(job_dir)
-            return
+            # --- حجم واقعی ---
+            if result.filesize > self.settings.upload_limit:
+                job.state = JobState.ERROR
+                job.error_kind = DownloadErrorKind.TOO_LARGE.value
+                job.error_text = _too_large_text(result.filesize, self.settings)
+                return
 
-        job.filesize = result.filesize
-        job.percent = 100.0
-        job.state = JobState.UPLOADING
+            job.filesize = result.filesize
+            job.percent = 100.0
+            job.state = JobState.UPLOADING
 
-        # --- ارسال به چت ---
-        if self.sender is None:
-            job.state = JobState.ERROR
-            job.error_text = "ارسال به تلگرام تنظیم نشده است."
-            remove_tree(job_dir)
-            return
+            if self.sender is None:
+                job.state = JobState.ERROR
+                job.error_text = "ارسال به تلگرام تنظیم نشده است."
+                return
 
-        try:
-            await self.sender(job.chat_id, result)
-        except Exception:  # noqa: BLE001
-            logger.exception("ارسال فایل به تلگرام ناموفق بود")
-            job.state = JobState.ERROR
-            job.error_kind = "send_failed"
-            job.error_text = "ارسال فایل به تلگرام ناموفق بود."
-            return
+            try:
+                await self.sender(job.chat_id, result)
+            except Exception:  # noqa: BLE001
+                logger.exception("ارسال فایل به تلگرام ناموفق بود")
+                job.state = JobState.ERROR
+                job.error_kind = "send_failed"
+                job.error_text = (
+                    "ارسال فایل به تلگرام ناموفق بود. مطمئن شو ربات را "
+                    "در تلگرام /start کرده‌ای و بلاک نکرده‌ای."
+                )
+                return
+
+            job.state = JobState.DONE
+            job.finished_at = time.time()
         finally:
+            # پوشه‌ی موقت همیشه — چه موفق، چه خطا، چه لغو — پاک می‌شود
             remove_tree(job_dir)
-
-        job.state = JobState.DONE
-        job.finished_at = time.time()
 
     async def _progress_loop(self, job: WebJob, tracker: ProgressTracker) -> None:
         """وضعیت پیشرفت را از ترد yt-dlp به کار منتقل می‌کند."""
@@ -567,18 +592,36 @@ class DownloadService:
 # ----------------------------------------------------------------------
 # ابزارها
 # ----------------------------------------------------------------------
-def _error_text(kind: DownloadErrorKind) -> str:
-    return {
+def _error_text(
+    kind: DownloadErrorKind, settings: Settings | None = None, detail: str = ""
+) -> str:
+    texts = {
         DownloadErrorKind.PRIVATE: "این ویدیو خصوصی است یا دسترسی به آن بسته شده.",
         DownloadErrorKind.UNAVAILABLE: "ویدیو در دسترس نیست — حذف شده یا در کشور شما محدود شده.",
-        DownloadErrorKind.LOGIN_REQUIRED: "این محتوا نیاز به ورود دارد. برای اینستاگرام، ادمین باید کوکی تنظیم کند.",
-        DownloadErrorKind.BOT_CHECK: "یوتیوب موقتاً درخواست‌های سرور را محدود کرده. چند دقیقه بعد امتحان کن.",
+        DownloadErrorKind.LOGIN_REQUIRED: "این محتوا نیاز به ورود دارد.",
+        DownloadErrorKind.BOT_CHECK: "پلتفرم موقتاً درخواست‌های سرور را محدود کرده. چند دقیقه بعد امتحان کن.",
+        DownloadErrorKind.FORMAT: "فرمت قابل دانلودی پیدا نشد. کیفیت دیگری را امتحان کن یا بعداً دوباره بفرست.",
+        DownloadErrorKind.NO_VIDEO: "این پست ویدیو ندارد.",
+        DownloadErrorKind.LIVE: "این پخش زنده یا ویدیوی زمان‌بندی‌شده است؛ بعد از پایان دوباره بفرست.",
         DownloadErrorKind.NOT_FOUND: "محتوایی پیدا نشد. لینک را بررسی کن.",
-        DownloadErrorKind.NETWORK: "خطا در اتصال. اتصال سرور را بررسی کن.",
+        DownloadErrorKind.NETWORK: "خطا در اتصال. دوباره امتحان کن.",
         DownloadErrorKind.TOO_LONG: "ویدیو طولانی‌تر از حد مجاز است.",
         DownloadErrorKind.TOO_LARGE: "حجم فایل زیاد است.",
         DownloadErrorKind.UNSUPPORTED: "این سایت پشتیبانی نمی‌شود.",
-    }.get(kind, "خطای پیش‌بینی‌نشده. دوباره امتحان کن.")
+    }
+    text = texts.get(kind)
+    if text is None:
+        text = "خطای پیش‌بینی‌نشده. دوباره امتحان کن."
+        if detail:
+            text += f" ({clean_detail(detail, 160)})"
+    elif kind in (DownloadErrorKind.LOGIN_REQUIRED, DownloadErrorKind.BOT_CHECK):
+        if settings is not None:
+            text += (
+                " کوکی‌ها احتمالاً منقضی شده‌اند؛ ادمین باید COOKIES_B64 را دوباره بسازد."
+                if settings.has_cookies
+                else " ادمین باید COOKIES_B64 را در Railway تنظیم کند."
+            )
+    return text
 
 
 def _too_large_text(size: int, settings: Settings) -> str:
