@@ -23,7 +23,6 @@ from downloader import (
     Downloader,
     InvalidLink,
     UnsupportedSite,
-    build_meta,
     clean_detail,
     parse_link,
     pick_height,
@@ -160,7 +159,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     status = await message.reply_text(msg.PROBING, parse_mode=ParseMode.HTML)
 
     try:
-        info = await downloader.probe(link.url)
+        meta = await downloader.probe_meta(link.url)
     except DownloadError as exc:
         await _edit_error(status, exc, settings, link.platform)
         return
@@ -168,8 +167,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.exception("خطای پیش‌بینی‌نشده در probe")
         await _safe_edit(status, msg.UNKNOWN_ERROR, kb.after_download_menu())
         return
-
-    meta = build_meta(info, settings, link.url)
 
     # --- محدودیت مدت ---
     if (
