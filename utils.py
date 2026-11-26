@@ -58,6 +58,16 @@ def remove_tree(path: Path) -> None:
         logger.warning("پاک‌سازی ناموفق: %s", path, exc_info=True)
 
 
+def safe_filename(title: str, ext: str, fallback: str = "video") -> str:
+    """نام فایل خوانا برای تلگرام (به‌جای شناسه‌ی یوتیوب)."""
+    import re
+
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", title or "")
+    name = re.sub(r"\s+", " ", name).strip(" .")[:80] or fallback
+    ext = ext if ext.startswith(".") else f".{ext}"
+    return f"{name}{ext}"
+
+
 def purge_old_files(directory: Path, max_age_seconds: int = 3600) -> int:
     """حذف پوشه‌های موقت قدیمی‌تر از max_age_seconds.
 
@@ -106,11 +116,22 @@ class ProgressState:
 class ProgressTracker:
     """yt-dlp در یک ترد جدا اجرا می‌شود؛ این کلاس وضعیت را
     با قفل به حلقه‌ی اصلی منتقل می‌کند تا race condition نباشد.
+
+    ویدیو و صدا جدا دانلود می‌شوند؛ پیشرفت هر دو جمع می‌شود تا نوار
+    پیشرفت وسط کار به صفر برنگردد.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._state = ProgressState()
+        self._base_done = 0   # مجموع فایل‌های کامل‌شده
+        self._base_total = 0
+        self._cur_total = 0
+
+    def reset(self) -> None:
+        with self._lock:
+            self._state = ProgressState()
+            self._base_done = self._base_total = self._cur_total = 0
 
     def update(self, **fields: object) -> None:
         with self._lock:
@@ -131,16 +152,31 @@ class ProgressTracker:
     # --- سازگار با progress_hooks یت‌دی‌ال‌پی ---
     def hook(self, data: dict) -> None:
         status = data.get("status")
-        if status == "downloading":
-            self.update(
-                status="downloading",
-                downloaded=int(data.get("downloaded_bytes") or 0),
-                total=int(data.get("total_bytes") or data.get("total_bytes_estimate") or 0),
-                speed=float(data.get("speed") or 0.0),
-                eta=int(data.get("eta") or 0),
-            )
-        elif status == "finished":
-            self.update(status="finished")
+        with self._lock:
+            if status == "downloading":
+                done = int(data.get("downloaded_bytes") or 0)
+                total = int(
+                    data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+                )
+                self._cur_total = total
+                self._state.status = "downloading"
+                self._state.downloaded = self._base_done + done
+                self._state.total = (self._base_total + total) if total else 0
+                self._state.speed = float(data.get("speed") or 0.0)
+                self._state.eta = int(data.get("eta") or 0)
+            elif status == "finished":
+                # یک فایل (ویدیو یا صدا) کامل شد؛ فایل بعدی ممکن است بیاید
+                size = int(
+                    data.get("total_bytes")
+                    or data.get("downloaded_bytes")
+                    or self._cur_total
+                    or 0
+                )
+                self._base_done += size
+                self._base_total += size
+                self._cur_total = 0
+                self._state.downloaded = self._base_done
+                self._state.total = self._base_total
 
 
 # ==================================================================
@@ -158,6 +194,8 @@ class Job:
     title: str
     duration: int | None
     heights: list[int]
+    sizes: dict[int, int] = field(default_factory=dict)
+    portrait: bool = False
     info: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
 
@@ -193,6 +231,8 @@ class JobRegistry:
         title: str,
         duration: int | None,
         heights: list[int],
+        sizes: dict[int, int] | None = None,
+        portrait: bool = False,
         info: dict[str, Any] | None = None,
     ) -> Job:
         job_id = secrets.token_hex(4)  # ۸ کاراکتر — داخل ۶۴ بایت جا می‌شود
@@ -203,6 +243,8 @@ class JobRegistry:
             title=title,
             duration=duration,
             heights=heights,
+            sizes=sizes or {},
+            portrait=portrait,
             info=info or {},
         )
         with self._lock:
@@ -259,6 +301,7 @@ BTN_BACK = "◀️ بازگشت"
 BTN_MAIN = "🏠 منوی اصلی"
 BTN_AGAIN = "🔁 دانلود دیگر"
 BTN_BEST = "⭐ بهترین کیفیت"
+BTN_BEST_AT = "⭐ بهترین ({height}p)"
 BTN_AUDIO = "🎵 فقط صدا (MP3)"
 BTN_QUALITY = "🎞 {height}p"
 BTN_YT = "▶️ یوتیوب"
@@ -446,15 +489,53 @@ LOGIN_REQUIRED = (
     f"{BRAND}\n"
     f"{DIVIDER}\n"
     "🔑 <b>این محتوا نیاز به ورود دارد</b>\n\n"
-    "<blockquote>برای اینستاگرام، ادمین ربات باید فایل کوکی را تنظیم کند.</blockquote>"
+    "<blockquote>پلتفرم برای این ویدیو حساب کاربری می‌خواهد "
+    "(مثلاً پست محدود به سن یا اینستاگرام).</blockquote>"
 )
 
 BOT_CHECK = (
     f"{BRAND}\n"
     f"{DIVIDER}\n"
-    "🤖 <b>یوتیوب موقتاً محدود کرده</b>\n\n"
-    "<blockquote>یوتیوب درخواست‌های سرور را محدود کرده است.\n"
+    "🤖 <b>پلتفرم درخواست سرور را محدود کرد</b>\n\n"
+    "<blockquote>سرویس‌ها گاهی IP سرورها را موقتاً مسدود می‌کنند.\n"
     "چند دقیقه بعد دوباره امتحان کن.</blockquote>"
+)
+
+# خط راهنما برای ادمین، وقتی کوکی تنظیم نشده یا کار نمی‌کند
+HINT_NO_COOKIES = (
+    "\n\n🛠 <i>ادمین: متغیر <code>COOKIES_B64</code> (کوکی مرورگر واردشده) "
+    "را در Railway تنظیم کند.</i>"
+)
+HINT_BAD_COOKIES = (
+    "\n\n🛠 <i>ادمین: کوکی‌ها احتمالاً منقضی شده‌اند؛ "
+    "<code>COOKIES_B64</code> را دوباره بسازد.</i>"
+)
+
+FORMAT_ERROR = (
+    f"{BRAND}\n"
+    f"{DIVIDER}\n"
+    "🎞 <b>فرمت قابل دانلود پیدا نشد</b>\n\n"
+    "<blockquote>یوتیوب فرمت‌های این ویدیو را به سرور نشان نمی‌دهد.\n"
+    "کیفیت دیگری را امتحان کن یا چند دقیقه بعد دوباره بفرست.</blockquote>"
+)
+
+NO_VIDEO = (
+    f"{BRAND}\n"
+    f"{DIVIDER}\n"
+    "🖼 <b>این پست ویدیو ندارد</b>\n\n"
+    "<blockquote>فقط پست‌های ویدیویی (ریلز، ویدیو) دانلود می‌شوند.</blockquote>"
+)
+
+LIVE_ERROR = (
+    f"{BRAND}\n"
+    f"{DIVIDER}\n"
+    "📡 <b>پخش زنده یا ویدیوی زمان‌بندی‌شده</b>\n\n"
+    "<blockquote>بعد از پایان پخش دوباره لینک را بفرست.</blockquote>"
+)
+
+ALL_TOO_LARGE = (
+    "\n\n⚠️ <b>حتی کمترین کیفیت از سقف ارسال بزرگ‌تر است.</b>\n"
+    "فقط دانلود صدا ممکن است."
 )
 
 NOT_FOUND = (
@@ -617,45 +698,55 @@ def back_menu() -> InlineKeyboardMarkup:
 # ----------------------------------------------------------------------
 # انتخاب کیفیت
 # ----------------------------------------------------------------------
+def _mb(size: int) -> str:
+    """۱۸۳۰۰۰۰۰ → «۱۸MB»"""
+    mb = size / (1024 * 1024)
+    return f"{mb:.0f}MB" if mb >= 10 else f"{mb:.1f}MB"
+
+
 def quality_menu(
     job_id: str,
     heights: list[int],
     *,
+    sizes: dict[int, int] | None = None,
+    limit: int = 0,
+    best: int | None = None,
     has_audio: bool = True,
 ) -> InlineKeyboardMarkup:
     """دکمه‌های کیفیت + صدا + لغو.
 
-    heights: ارتفاع‌های واقعاً موجود در این ویدیو (نزولی).
-    اگر خالی باشد، فقط «بهترین کیفیت» و صدا نشان داده می‌شود.
+    فقط کیفیت‌هایی نشان داده می‌شوند که در سقف ارسال جا می‌شوند؛ کنار
+    هر کیفیت حجم تخمینی می‌آید.
     """
+    sizes = sizes or {}
     rows: list[list[InlineKeyboardButton]] = []
 
-    # ردیف اول: بهترین کیفیت (تمام‌عرض — برجسته‌ترین انتخاب)
-    rows.append([_btn(BTN_BEST, f"{ACT_QUALITY}:{job_id}:best")])
+    usable = [
+        h for h in heights
+        if not limit or not sizes.get(h) or sizes[h] <= limit * 0.92
+    ]
 
-    # ردیف‌های بعدی: کیفیت‌های مشخص، دو‌ستونی
-    picked = [h for h in QUALITY_CHOICES if h in heights]
-    if not picked:
-        picked = sorted(heights, reverse=True)[:4]
+    if usable or not heights:
+        label = BTN_BEST_AT.format(height=best) if best else BTN_BEST
+        rows.append([_btn(label, f"{ACT_QUALITY}:{job_id}:best")])
 
-    pair: list[InlineKeyboardButton] = []
-    for height in picked:
-        pair.append(
-            _btn(BTN_QUALITY.format(height=height), f"{ACT_QUALITY}:{job_id}:{height}")
-        )
-        if len(pair) == 2:
+        picked = [h for h in QUALITY_CHOICES if h in usable] or usable[:4]
+        pair: list[InlineKeyboardButton] = []
+        for height in picked:
+            text = BTN_QUALITY.format(height=height)
+            if sizes.get(height):
+                text += f" · {_mb(sizes[height])}"
+            pair.append(_btn(text, f"{ACT_QUALITY}:{job_id}:{height}"))
+            if len(pair) == 2:
+                rows.append(pair)
+                pair = []
+        if pair:
             rows.append(pair)
-            pair = []
-    if pair:
-        rows.append(pair)
 
-    # صدا
     if has_audio:
         rows.append([_btn(BTN_AUDIO, f"{ACT_AUDIO}:{job_id}")])
 
-    # لغو
     rows.append([_btn(BTN_CANCEL, f"{ACT_CANCEL}:{job_id}")])
-
     return InlineKeyboardMarkup(rows)
 
 
