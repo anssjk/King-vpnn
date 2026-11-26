@@ -40,6 +40,10 @@ class Settings:
     max_height: int
     cookies_file: Path | None
     log_level: str
+    # حداکثر دانلود همزمان (Railway رایگان/Trial رم کمی دارد)
+    max_concurrent: int = 2
+    # پروکسی اختیاری برای دور زدن بلاک یوتیوب/اینستاگرام روی IP دیتاسنتر
+    proxy_url: str | None = None
     # --- Mini App ---
     web_host: str = "0.0.0.0"
     web_port: int = 8080
@@ -51,6 +55,10 @@ class Settings:
         if self.local_api_url:
             return min(self.max_filesize_mb * 1024 * 1024, LOCAL_UPLOAD_LIMIT)
         return min(self.max_filesize_mb * 1024 * 1024, CLOUD_UPLOAD_LIMIT)
+
+    @property
+    def has_cookies(self) -> bool:
+        return self.cookies_file is not None
 
     @property
     def uses_local_api(self) -> bool:
@@ -145,6 +153,8 @@ def get_settings() -> Settings:
         max_height=_int("MAX_HEIGHT", 1080),
         cookies_file=cookies,
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        max_concurrent=max(1, _int("MAX_CONCURRENT", 2)),
+        proxy_url=os.getenv("PROXY_URL", "").strip() or None,
         web_host=os.getenv("WEB_HOST", "0.0.0.0").strip() or "0.0.0.0",
         # Railway پورت را در PORT می‌دهد؛ WEB_PORT برای اجرای محلی است
         web_port=_int("PORT", _int("WEB_PORT", 8080)),
