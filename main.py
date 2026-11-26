@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import signal
 import sys
 
 from aiohttp import web
-from telegram import BotCommand
-from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram import Bot, BotCommand
+from telegram.error import InvalidToken, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -30,7 +30,7 @@ from telegram.request import HTTPXRequest
 
 import utils as kb
 from config import ConfigError, Settings, get_settings
-from downloader import Downloader, DownloadResult
+from downloader import Downloader, DownloadResult, ffmpeg_available
 from handlers import (
     cmd_help,
     cmd_start,
@@ -43,6 +43,7 @@ from handlers import (
     on_platforms,
     on_quality,
     on_status,
+    send_media,
 )
 from utils import JobRegistry, human_size, purge_old_files
 from webapp import DownloadService, create_app
@@ -171,60 +172,50 @@ async def _post_init(application: Application) -> None:
 
 
 def make_sender(bot: Bot, settings: Settings):
-    """تابع ارسال فایل به چت — همان چیزی که سرویس انتظار دارد."""
+    """تابع ارسال فایل به چت — همان چیزی که سرویس Mini App انتظار دارد.
+
+    منطق ارسال با ربات مشترک است (handlers.send_media).
+    """
 
     async def send(chat_id: int, result: DownloadResult) -> None:
-        title = (result.title or "ویدیو").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        size = human_size(result.filesize)
-
-        if result.is_audio:
-            caption = f"🎵 <b>{title}</b>\n📦 {size}"
-            try:
-                with result.path.open("rb") as fh:
-                    await bot.send_audio(
-                        chat_id=chat_id,
-                        audio=fh,
-                        caption=caption,
-                        parse_mode=ParseMode.HTML,
-                        title=result.title[:64],
-                        read_timeout=300,
-                        write_timeout=300,
-                    )
-                return
-            except TelegramError as exc:
-                logger.warning("ارسال صدا ناموفق، تلاش به‌عنوان فایل: %s", exc)
-
-        caption = f"🎬 <b>{title}</b>\n📦 {size}"
-
-        try:
-            with result.path.open("rb") as fh:
-                await bot.send_video(
-                    chat_id=chat_id,
-                    video=fh,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    supports_streaming=True,
-                    width=result.width,
-                    height=result.height,
-                    duration=result.duration,
-                    read_timeout=300,
-                    write_timeout=300,
-                )
-            return
-        except TelegramError as exc:
-            logger.warning("ارسال ویدیو ناموفق، تلاش به‌عنوان فایل: %s", exc)
-
-        with result.path.open("rb") as fh:
-            await bot.send_document(
-                chat_id=chat_id,
-                document=fh,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                read_timeout=300,
-                write_timeout=300,
-            )
+        await send_media(bot, chat_id, result, result.platform or "")
 
     return send
+
+
+def log_environment() -> None:
+    """نسخه‌ی ابزارها را در لاگ می‌نویسد؛ برای عیب‌یابی دانلود خیلی مفید است."""
+    try:
+        import yt_dlp
+
+        ytdlp_version = yt_dlp.version.__version__
+    except Exception:  # noqa: BLE001
+        ytdlp_version = "؟"
+
+    js_runtime = next(
+        (name for name in ("deno", "node", "bun") if shutil.which(name)), None
+    )
+    logger.info(
+        "yt-dlp=%s | ffmpeg=%s | JS runtime=%s",
+        ytdlp_version,
+        "هست" if ffmpeg_available() else "نیست",
+        js_runtime or "نیست",
+    )
+    if js_runtime is None:
+        logger.warning(
+            "هیچ JS runtime (deno/node) نصب نیست؛ یوتیوب بدون آن معمولاً "
+            "فرمت‌ها را نشان نمی‌دهد. Dockerfile جدید را استفاده کنید."
+        )
+
+
+async def _purge_loop(settings: Settings) -> None:
+    """هر نیم‌ساعت پوشه‌های جامانده از دانلودهای قدیمی را پاک می‌کند."""
+    while True:
+        await asyncio.sleep(30 * 60)
+        try:
+            purge_old_files(settings.download_dir, max_age_seconds=3600)
+        except Exception:  # noqa: BLE001
+            logger.debug("پاک‌سازی دوره‌ای ناموفق بود", exc_info=True)
 
 
 def _install_signal_handlers(stop: asyncio.Event) -> None:
@@ -239,6 +230,12 @@ def _install_signal_handlers(stop: asyncio.Event) -> None:
 
 async def run(settings: Settings) -> None:
     settings.download_dir.mkdir(parents=True, exist_ok=True)
+    log_environment()
+    if not settings.has_cookies:
+        logger.info(
+            "کوکی تنظیم نشده (COOKIES_B64). اینستاگرام و بعضی ویدیوهای "
+            "یوتیوب بدون کوکی ممکن است دانلود نشوند."
+        )
 
     application = build_application(settings)
 
@@ -266,6 +263,7 @@ async def run(settings: Settings) -> None:
     )
 
     # ۲) بعد ربات
+    purge_task = asyncio.create_task(_purge_loop(settings))
     try:
         await application.initialize()
         await _post_init(application)
@@ -279,6 +277,7 @@ async def run(settings: Settings) -> None:
         await stop.wait()
         logger.info("سیگنال خاموشی دریافت شد؛ در حال بستن...")
     finally:
+        purge_task.cancel()
         for step in (
             application.updater.stop,
             application.stop,
@@ -308,7 +307,15 @@ def main() -> int:
         settings.webapp_url or "غیرفعال (WEBAPP_URL خالی است)",
     )
 
-    asyncio.run(run(settings))
+    try:
+        asyncio.run(run(settings))
+    except InvalidToken:
+        print(
+            "❌ BOT_TOKEN نامعتبر است (تلگرام قبولش نکرد).\n"
+            "توکن را دوباره از BotFather کپی کنید و در Railway ← Variables بگذارید.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
