@@ -437,6 +437,52 @@ def build_meta(info: dict, settings: Settings, fallback_url: str) -> VideoMeta:
     )
 
 
+# کیفیت‌های پیشنهادی وقتی اطلاعات ویدیو در دسترس نیست («حالت کور»)
+BLIND_QUALITIES = (1080, 720, 480, 360)
+
+
+def blind_meta(url: str, settings: Settings) -> VideoMeta:
+    """وقتی yt-dlp اطلاعات ویدیو را نگرفت ولی API‌ها ممکن است دانلود کنند."""
+    heights = [h for h in BLIND_QUALITIES if h <= settings.max_height] or [360]
+    return VideoMeta(
+        title="ویدیو",
+        duration=None,
+        heights=heights,
+        sizes={},
+        portrait=False,
+        thumbnail="",
+        webpage_url=url,
+        best_height=heights[0],
+        best_size=0,
+        fitting=list(heights),
+    )
+
+
+# خطاهایی که «محتوا مشکل دارد» نیستند و API‌ها ممکن است دور بزنندشان
+_BLIND_OK = {
+    DownloadErrorKind.BOT_CHECK,
+    DownloadErrorKind.LOGIN_REQUIRED,
+    DownloadErrorKind.FORMAT,
+    DownloadErrorKind.NETWORK,
+    DownloadErrorKind.UNKNOWN,
+}
+
+# اولویت انتخاب خطا برای نمایش، وقتی همه‌ی ارائه‌دهنده‌ها شکست خورده‌اند
+_ERROR_PRIORITY = (
+    DownloadErrorKind.PRIVATE,
+    DownloadErrorKind.LIVE,
+    DownloadErrorKind.NO_VIDEO,
+    DownloadErrorKind.TOO_LARGE,
+    DownloadErrorKind.UNAVAILABLE,
+    DownloadErrorKind.NOT_FOUND,
+    DownloadErrorKind.LOGIN_REQUIRED,
+    DownloadErrorKind.BOT_CHECK,
+    DownloadErrorKind.FORMAT,
+    DownloadErrorKind.NETWORK,
+    DownloadErrorKind.UNKNOWN,
+)
+
+
 # ==================================================================
 # موتور
 # ==================================================================
@@ -525,6 +571,19 @@ class Downloader:
                 logger.warning("هیچ فرمت ویدیو/صدایی پیدا نشد: %s", url)
                 raise DownloadError(DownloadErrorKind.FORMAT, "no playable formats")
         return info
+
+    async def probe_meta(self, url: str) -> VideoMeta:
+        """اطلاعات ویدیو؛ اگر yt-dlp نتوانست و API‌ها فعال‌اند، «حالت کور»."""
+        use_ytdlp = "ytdlp" in self.settings.providers
+        try:
+            if not use_ytdlp:
+                raise DownloadError(DownloadErrorKind.UNKNOWN, "yt-dlp disabled")
+            return build_meta(await self.probe(url), self.settings, url)
+        except DownloadError as exc:
+            if self.settings.has_api_providers and exc.kind in _BLIND_OK:
+                logger.info("probe با yt-dlp نشد (%s)؛ حالت کور با API‌ها", exc.kind.value)
+                return blind_meta(url, self.settings)
+            raise
 
     # ------------------------------------------------------------------
     # سلکتور فرمت
@@ -745,6 +804,54 @@ class Downloader:
         ]
         return max(media, key=lambda p: p.stat().st_size) if media else None
 
+    async def _download_via_api(
+        self,
+        name: str,
+        resolve,
+        url: str,
+        out_dir: Path,
+        tracker: ProgressTracker,
+        height: int | None,
+        audio_only: bool,
+        cancel_event: threading.Event | None,
+        platform: str,
+    ) -> DownloadResult:
+        """یک ارائه‌دهنده‌ی API: لینک مستقیم بگیر، دانلود کن؛ اگر بزرگ بود کیفیت را کم کن."""
+        import providers
+
+        limit = self.settings.upload_limit
+        start = height or self.settings.max_height
+        ladder = [start] + [q for q in (1080, 720, 480, 360, 240) if q < start]
+        ladder = ladder[:3] if not audio_only else ladder[:1]
+
+        async with providers.new_session() as session:
+            last: DownloadError | None = None
+            for quality in ladder:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise DownloadCancelled("cancelled by user")
+                resolved = await resolve(session, url, quality, audio_only)
+                try:
+                    path = await providers.http_download(
+                        session, resolved, out_dir, tracker, cancel_event, limit
+                    )
+                except DownloadError as exc:
+                    if exc.kind is DownloadErrorKind.TOO_LARGE and not audio_only:
+                        logger.info("%s: %sp بزرگ است؛ کیفیت پایین‌تر", name, quality)
+                        last = exc
+                        tracker.reset()
+                        continue
+                    raise
+                title = resolved.title or "ویدیو"
+                return DownloadResult(
+                    path=path,
+                    title=title[:200],
+                    duration=None,
+                    filesize=path.stat().st_size,
+                    platform=platform,
+                    is_audio=audio_only or resolved.is_audio,
+                )
+            raise last or DownloadError(DownloadErrorKind.TOO_LARGE)
+
     async def download(
         self,
         url: str,
@@ -757,28 +864,66 @@ class Downloader:
         audio_only: bool = False,
         cancel_event: threading.Event | None = None,
     ) -> DownloadResult:
-        """دانلود در ترد جدا؛ حداکثر `max_concurrent` دانلود همزمان."""
+        """دانلود با زنجیره‌ی ارائه‌دهنده‌ها (به ترتیب PROVIDERS).
+
+        هر کدام شکست بخورد، بعدی امتحان می‌شود. حداکثر `max_concurrent`
+        دانلود همزمان.
+        """
+        import providers
+
+        try:
+            platform = detect_platform(url)
+        except (InvalidLink, UnsupportedSite):
+            platform = ""
+
         async with self._sem:
-            if cancel_event is not None and cancel_event.is_set():
-                raise DownloadCancelled("cancelled before start")
-            try:
-                return await asyncio.to_thread(
-                    self._download_sync,
-                    url,
-                    out_dir,
-                    tracker,
-                    height,
-                    sorted(set(heights or []), reverse=True),
-                    portrait,
-                    audio_only,
-                    cancel_event,
-                )
-            except (DownloadCancelled, DownloadError):
-                raise
-            except Exception as exc:  # noqa: BLE001
+            errors: list[DownloadError] = []
+
+            # فهرست تلاش‌ها به ترتیب: ('ytdlp', None) یا (نام, تابع resolve)
+            plan: list[tuple[str, object]] = []
+            api_attempts = providers.build_attempts(self.settings, platform)
+            for prov in self.settings.providers:
+                if prov == "ytdlp":
+                    plan.append(("ytdlp", None))
+                else:
+                    plan.extend(
+                        (n, f) for n, f in api_attempts
+                        if n == prov or n.startswith(prov + "@")
+                    )
+
+            for name, resolve in plan:
                 if cancel_event is not None and cancel_event.is_set():
-                    raise DownloadCancelled("cancelled by user") from exc
-                raise self._to_download_error(exc) from exc
+                    raise DownloadCancelled("cancelled by user")
+                self._clean_dir(out_dir)
+                tracker.reset()
+                try:
+                    if name == "ytdlp":
+                        return await asyncio.to_thread(
+                            self._download_sync, url, out_dir, tracker, height,
+                            sorted(set(heights or []), reverse=True),
+                            portrait, audio_only, cancel_event,
+                        )
+                    return await self._download_via_api(
+                        name, resolve, url, out_dir, tracker, height,
+                        audio_only, cancel_event, platform,
+                    )
+                except DownloadCancelled:
+                    raise
+                except DownloadError as exc:
+                    logger.warning("ارائه‌دهنده %s شکست خورد [%s]: %s",
+                                   name, exc.kind.value, exc.detail[:150])
+                    errors.append(exc)
+                except Exception as exc:  # noqa: BLE001
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise DownloadCancelled("cancelled by user") from exc
+                    errors.append(self._to_download_error(exc))
+
+            if not errors:
+                raise DownloadError(DownloadErrorKind.UNKNOWN, "هیچ ارائه‌دهنده‌ای فعال نیست")
+            # مهم‌ترین خطا را نشان بده
+            errors.sort(key=lambda e: _ERROR_PRIORITY.index(e.kind)
+                        if e.kind in _ERROR_PRIORITY else len(_ERROR_PRIORITY))
+            raise errors[0]
 
     @staticmethod
     def _to_download_error(exc: Exception) -> DownloadError:
