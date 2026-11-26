@@ -44,6 +44,12 @@ class Settings:
     max_concurrent: int = 2
     # پروکسی اختیاری برای دور زدن بلاک یوتیوب/اینستاگرام روی IP دیتاسنتر
     proxy_url: str | None = None
+    # --- ارائه‌دهنده‌های دانلود (به همین ترتیب امتحان می‌شوند) ---
+    providers: tuple[str, ...] = ("cobalt", "tikwm", "piped", "invidious", "ytdlp")
+    cobalt_urls: tuple[str, ...] = ()
+    cobalt_api_key: str = ""
+    piped_urls: tuple[str, ...] = ()
+    invidious_urls: tuple[str, ...] = ()
     # --- Mini App ---
     web_host: str = "0.0.0.0"
     web_port: int = 8080
@@ -61,6 +67,20 @@ class Settings:
         return self.cookies_file is not None
 
     @property
+    def has_api_providers(self) -> bool:
+        """آیا غیر از yt-dlp، ارائه‌دهنده‌ی دیگری فعال است؟"""
+        return any(p != "ytdlp" and self.provider_enabled(p) for p in self.providers)
+
+    def provider_enabled(self, name: str) -> bool:
+        if name == "cobalt":
+            return bool(self.cobalt_urls)
+        if name == "piped":
+            return bool(self.piped_urls)
+        if name == "invidious":
+            return bool(self.invidious_urls)
+        return name in ("tikwm", "ytdlp")
+
+    @property
     def uses_local_api(self) -> bool:
         return bool(self.local_api_url)
 
@@ -68,6 +88,31 @@ class Settings:
     def has_webapp(self) -> bool:
         """آیا Mini App تنظیم شده است؟"""
         return bool(self.webapp_url)
+
+
+KNOWN_PROVIDERS = ("cobalt", "tikwm", "piped", "invidious", "ytdlp")
+
+
+def _list(name: str, default: str = "") -> tuple[str, ...]:
+    """لیست جداشده با ویرگول از متغیر محیطی (آدرس‌ها بدون «/» انتهایی)."""
+    raw = os.getenv(name)
+    raw = default if raw is None else raw
+    items = [x.strip().rstrip("/") for x in raw.replace("\n", ",").split(",")]
+    return tuple(x for x in items if x)
+
+
+def _providers() -> tuple[str, ...]:
+    raw = os.getenv("PROVIDERS", "").strip()
+    if not raw:
+        return KNOWN_PROVIDERS
+    names = tuple(x.strip().lower() for x in raw.split(",") if x.strip())
+    unknown = [n for n in names if n not in KNOWN_PROVIDERS]
+    if unknown:
+        raise ConfigError(
+            f"PROVIDERS شامل نام ناشناخته است: {', '.join(unknown)}\n"
+            f"نام‌های مجاز: {', '.join(KNOWN_PROVIDERS)}"
+        )
+    return names
 
 
 def _resolve_cookies(download_dir: Path) -> Path | None:
@@ -155,6 +200,12 @@ def get_settings() -> Settings:
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         max_concurrent=max(1, _int("MAX_CONCURRENT", 2)),
         proxy_url=os.getenv("PROXY_URL", "").strip() or None,
+        providers=_providers(),
+        cobalt_urls=_list("COBALT_API_URL"),
+        cobalt_api_key=os.getenv("COBALT_API_KEY", "").strip(),
+        # نمونه‌های عمومی؛ ممکن است از کار افتاده باشند. با متغیر خودتان عوضشان کنید.
+        piped_urls=_list("PIPED_URLS", "https://pipedapi.kavin.rocks"),
+        invidious_urls=_list("INVIDIOUS_URLS", "https://inv.nadeko.net,https://yewtu.be"),
         web_host=os.getenv("WEB_HOST", "0.0.0.0").strip() or "0.0.0.0",
         # Railway پورت را در PORT می‌دهد؛ WEB_PORT برای اجرای محلی است
         web_port=_int("PORT", _int("WEB_PORT", 8080)),
