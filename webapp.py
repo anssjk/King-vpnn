@@ -26,7 +26,6 @@ from downloader import (
     DownloadResult,
     InvalidLink,
     UnsupportedSite,
-    build_meta,
     clean_detail,
     fits,
     parse_link,
@@ -408,14 +407,12 @@ class DownloadService:
         job.state = JobState.PROBING
 
         try:
-            info = await self.downloader.probe(link.url)
+            meta = await self.downloader.probe_meta(link.url)
         except DownloadError as exc:
             job.state = JobState.ERROR
             job.error_kind = exc.kind.value
             job.error_text = _error_text(exc.kind, self.settings, exc.detail)
             raise ServiceError("probe_failed", job.error_text, 422) from exc
-
-        meta = build_meta(info, self.settings, link.url)
 
         # --- محدودیت مدت ---
         if (
